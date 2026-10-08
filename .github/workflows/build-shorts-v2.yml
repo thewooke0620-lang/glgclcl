@@ -1,0 +1,155 @@
+name: Build experimental Shorts patch v2
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Get official Morphe 1.46.0 source
+        uses: actions/checkout@v7
+        with:
+          repository: MorpheApp/morphe-patches
+          ref: 1bcd0bcedf1238e71b0bd8815da2c10df7ef5bd2
+          path: morphe-patches
+          persist-credentials: false
+      - name: Get previous experiment
+        uses: actions/checkout@v7
+        with:
+          repository: thewooke0620-lang/glgclcl
+          ref: 20d142254baade30a764da774bed2fd436695878
+          path: previous-experiment
+          persist-credentials: false
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Apply previous experiment
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, subprocess
+          p = Path('previous-experiment/.github/workflows/build-shorts.yml')
+          assert hashlib.sha256(p.read_bytes()).hexdigest() == 'cf3edfe901ba1a47210999c728b9e5af3242fa03c52614fd3577fe22187d0023'
+          s = p.read_text()
+          begin = s.index("          python3 - <<'PY'\n") + len("          python3 - <<'PY'\n")
+          end = s.index("          PY\n", begin)
+          lines = s[begin:end].splitlines()
+          assert all(not line.strip() or line.startswith('          ') for line in lines)
+          code = '\n'.join(line[10:] for line in lines) + '\n'
+          subprocess.run(['python3', '-c', code], check=True)
+          PY
+      - name: Apply native Shorts playback correction
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          
+          root = Path('morphe-patches')
+          def replace(path, old, new):
+              p = root / path
+              s = p.read_text()
+              assert s.count(old) == 1, (path, old)
+              p.write_text(s.replace(old, new))
+          
+          base = 'extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/'
+          replace(base + 'ShortsRequestTracker.java',
+              '    private ShortsRequestTracker() { }',
+              '''    private ShortsRequestTracker() { }
+              private static volatile boolean currentShort;
+          
+              public static boolean isCurrentShort() { return currentShort; }
+          
+              public static synchronized void recordPlayback(String videoId, String parameters, boolean openingOrPlaying) {
+                  record(videoId, parameters);
+                  if (videoId == null || videoId.isEmpty() || parameters == null || parameters.isEmpty()) return;
+                  boolean shortRequest = parameters.startsWith("8AEB");
+                  // Follow Morphe's existing active-video classification rule.
+                  // Shorts background preloads must not replace the active playback context.
+                  if (!shortRequest || openingOrPlaying) currentShort = shortRequest;
+              }''')
+          replace('extensions/youtube/src/main/java/app/morphe/extension/youtube/patches/spoof/SpoofVideoStreamsPatch.java',
+              'ShortsRequestTracker.record(videoId, parameters);',
+              'ShortsRequestTracker.recordPlayback(videoId, parameters, openingOrPlaying);')
+          p = root / (base + 'SpoofVideoStreamsPatch.java')
+          s = p.read_text()
+          s = s.replace('    public static boolean isSpoofingEnabled() {\n        return SPOOF_VIDEO_STREAMS;\n    }',
+          '''    private static boolean bypassCurrentShort() {
+                  return SharedYouTubeSettings.SPOOF_VIDEO_STREAMS_SKIP_SHORTS.get()
+                          && ShortsRequestTracker.isCurrentShort();
+              }
+          
+              public static boolean isSpoofingEnabled() {
+                  return SPOOF_VIDEO_STREAMS && !bypassCurrentShort();
+              }''')
+          for name in ['fixHLSCurrentTime', 'useMediaFetchHotConfigReplacement',
+                       'usePlaybackStartFeatureFlag', 'useMediaSessionFeatureFlag']:
+              signature = '    public static boolean ' + name + '(boolean original) {'
+              assert s.count(signature) == 1, name
+              s = s.replace(signature, signature + '\n        if (bypassCurrentShort()) return original;')
+          # Reel response is specifically the Shorts endpoint. It can be evaluated before
+          # the active-video hook, so preserve its native value for the entire experiment.
+          signature = '    public static boolean useReelItemWatchResponseFeatureFlag(boolean original) {'
+          assert s.count(signature) == 1
+          s = s.replace(signature, signature + '\n        if (SharedYouTubeSettings.SPOOF_VIDEO_STREAMS_SKIP_SHORTS.get()) return original;')
+          s = s.replace('return SPOOF_VIDEO_STREAMS && !StreamingDataRequest.getLastSpoofedClientUseSABR();',
+                        'return isSpoofingEnabled() && !StreamingDataRequest.getLastSpoofedClientUseSABR();')
+          # ID-less request builders do not provide enough data for the original per-ID rule.
+          s = s.replace('if (bypassShort(requestUri.getQueryParameter("id"))) return innerTubeRequestBuilder;',
+          '''String requestId = requestUri.getQueryParameter("id");
+                          if (bypassShort(requestId) || (requestId == null && bypassCurrentShort())) return innerTubeRequestBuilder;''')
+          s = s.replace('if (bypassShort(originalUri.getQueryParameter("id"))) return originalUrlString;',
+          '''String requestId = originalUri.getQueryParameter("id");
+                          if (bypassShort(requestId) || (requestId == null && bypassCurrentShort())) return originalUrlString;''')
+          s = s.replace('&& "ANDROID".equals(uri.getQueryParameter("c"))) return postData;',
+          '''&& ("ANDROID".equals(uri.getQueryParameter("c"))
+                                      || (uri.getQueryParameter("c") == null && bypassCurrentShort()))) return postData;''')
+          p.write_text(s)
+          replace('gradle.properties', 'version = 1.46.0-shorts-experimental.1',
+                  'version = 1.46.0-shorts-experimental.2')
+          print('Applied experimental v2: native Shorts playback flags and SABR')
+          PY
+      - name: Check v2 request classification
+        shell: bash
+        run: |
+          cat > ShortsV2Test.java <<'JAVA'
+          import app.morphe.extension.shared.spoof.ShortsRequestTracker;
+          public class ShortsV2Test {
+              static void check(boolean value) { if (!value) throw new AssertionError(); }
+              public static void main(String[] args) {
+                  ShortsRequestTracker.recordPlayback("long", "regular", false);
+                  check(!ShortsRequestTracker.isCurrentShort());
+                  ShortsRequestTracker.recordPlayback("preload", "8AEB", false);
+                  check(!ShortsRequestTracker.isCurrentShort());
+                  check(ShortsRequestTracker.isShort("preload"));
+                  ShortsRequestTracker.recordPlayback("opened", "8AEB", true);
+                  check(ShortsRequestTracker.isCurrentShort());
+                  check(!ShortsRequestTracker.isShort("long"));
+                  ShortsRequestTracker.recordPlayback("opened", "regular", false);
+                  check(!ShortsRequestTracker.isCurrentShort());
+                  check(!ShortsRequestTracker.isShort("opened"));
+                  System.out.println("V2 classification checks passed");
+              }
+          }
+          JAVA
+          javac -d test-classes morphe-patches/extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/ShortsRequestTracker.java ShortsV2Test.java
+          java -cp test-classes ShortsV2Test
+      - name: Build patch bundle
+        working-directory: morphe-patches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :patches:buildAndroid --no-daemon --console=plain
+      - name: Upload patch bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: morphe-shorts-experimental-v2
+          path: morphe-patches/patches/build/libs/*.mpp
+          if-no-files-found: error
+          retention-days: 14
