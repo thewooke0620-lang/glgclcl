@@ -1,4 +1,4 @@
-name: Build experimental Shorts patch v2
+name: Build experimental Shorts patch v3
 on:
   workflow_dispatch:
 permissions:
@@ -139,6 +139,44 @@ jobs:
           JAVA
           javac -d test-classes morphe-patches/extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/ShortsRequestTracker.java ShortsV2Test.java
           java -cp test-classes ShortsV2Test
+      - name: Correct Shorts startup requests v3
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('morphe-patches')
+          def replace(path, old, new):
+              p = root / path
+              s = p.read_text()
+              assert s.count(old) == 1, (path, old)
+              p.write_text(s.replace(old, new))
+          shared = 'extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/SpoofVideoStreamsPatch.java'
+          replace(shared, '    private static boolean bypassCurrentShort() {',
+          '''    private static volatile java.util.function.BooleanSupplier shortsUiResolver = () -> false;
+          
+              public static void setShortsUiResolver(java.util.function.BooleanSupplier resolver) {
+                  shortsUiResolver = java.util.Objects.requireNonNull(resolver);
+              }
+          
+              private static boolean bypassCurrentShort() {''')
+          replace(shared, '                && ShortsRequestTracker.isCurrentShort();',
+              '                && (ShortsRequestTracker.isCurrentShort() || shortsUiResolver.getAsBoolean());')
+          for result, label in [('innerTubeRequestBuilder', 'get_watch'), ('originalUrlString', 'initplayback')]:
+              replace(shared,
+                  '                if (bypassShort(requestId) || (requestId == null && bypassCurrentShort())) return ' + result + ';',
+                  '                if (bypassShort(requestId) || bypassCurrentShort()) {\n'
+                  '                    Logger.printDebug(() -> "Shorts v3: preserving native ' + label + ' request");\n'
+                  '                    return ' + result + ';\n                }')
+          yt = 'extensions/youtube/src/main/java/app/morphe/extension/youtube/patches/spoof/SpoofVideoStreamsPatch.java'
+          replace(yt, '    public static void setClientOrderToUse() {',
+          '''    public static void setClientOrderToUse() {
+                  app.morphe.extension.shared.spoof.SpoofVideoStreamsPatch.setShortsUiResolver(
+                          () -> app.morphe.extension.youtube.shared.ShortsPlayerState.isOpen()
+                                  && app.morphe.extension.youtube.shared.PlayerType.getCurrent().isNoneOrHidden());''')
+          replace('gradle.properties', 'version = 1.46.0-shorts-experimental.2',
+                  'version = 1.46.0-shorts-experimental.3')
+          print('Applied v3 native startup request bypass; playback verification pending')
+          PY
       - name: Build patch bundle
         working-directory: morphe-patches
         env:
@@ -149,7 +187,7 @@ jobs:
       - name: Upload patch bundle
         uses: actions/upload-artifact@v7
         with:
-          name: morphe-shorts-experimental-v2
+          name: morphe-shorts-experimental-v3
           path: morphe-patches/patches/build/libs/*.mpp
           if-no-files-found: error
           retention-days: 14
