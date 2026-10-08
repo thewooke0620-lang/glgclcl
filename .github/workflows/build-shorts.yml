@@ -1,4 +1,4 @@
-name: Build experimental Shorts patch
+name: Build experimental Shorts patch v2
 on:
   workflow_dispatch:
 permissions:
@@ -16,166 +16,129 @@ jobs:
           ref: 1bcd0bcedf1238e71b0bd8815da2c10df7ef5bd2
           path: morphe-patches
           persist-credentials: false
+      - name: Get previous experiment
+        uses: actions/checkout@v7
+        with:
+          repository: thewooke0620-lang/glgclcl
+          ref: 20d142254baade30a764da774bed2fd436695878
+          path: previous-experiment
+          persist-credentials: false
       - name: Set up Java
         uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
-      - name: Apply experimental source modifications
+      - name: Apply previous experiment
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
+          import hashlib, subprocess
+          p = Path('previous-experiment/.github/workflows/build-shorts.yml')
+          assert hashlib.sha256(p.read_bytes()).hexdigest() == 'cf3edfe901ba1a47210999c728b9e5af3242fa03c52614fd3577fe22187d0023'
+          s = p.read_text()
+          begin = s.index("          python3 - <<'PY'\n") + len("          python3 - <<'PY'\n")
+          end = s.index("          PY\n", begin)
+          lines = s[begin:end].splitlines()
+          assert all(not line.strip() or line.startswith('          ') for line in lines)
+          code = '\n'.join(line[10:] for line in lines) + '\n'
+          subprocess.run(['python3', '-c', code], check=True)
+          PY
+      - name: Apply native Shorts playback correction
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          
           root = Path('morphe-patches')
           def replace(path, old, new):
               p = root / path
               s = p.read_text()
               assert s.count(old) == 1, (path, old)
               p.write_text(s.replace(old, new))
-
-          shared = 'extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/'
-          replace(shared + 'settings/SharedYouTubeSettings.java',
-              '    // Miscellaneous\n',
-              '    // Experimental YouTube-only switch; Music never registers Shorts requests.\n'
-              '    public static final BooleanSetting SPOOF_VIDEO_STREAMS_SKIP_SHORTS = new BooleanSetting("morphe_spoof_video_streams_skip_shorts", FALSE, true);\n\n    // Miscellaneous\n')
-
-          tracker = '''package app.morphe.extension.shared.spoof;
-
-          import java.util.LinkedHashMap;
-          import java.util.Map;
-
-          /** Request metadata, independent of the currently visible player or Shorts preloads. */
-          public final class ShortsRequestTracker {
-              private static final Map<String, Boolean> requests = new LinkedHashMap<>(512, 0.75f, true);
-              private ShortsRequestTracker() { }
-
-              public static synchronized void record(String videoId, String parameters) {
-                  if (videoId == null || videoId.isEmpty()) return;
-                  // Unknown parameters remove stale metadata instead of guessing from the UI.
-                  if (parameters == null || parameters.isEmpty()) {
-                      requests.remove(videoId);
-                      return;
-                  }
-                  requests.put(videoId, parameters.startsWith("8AEB"));
-                  if (requests.size() > 512) requests.remove(requests.keySet().iterator().next());
-              }
-
-              public static synchronized boolean isShort(String videoId) {
-                  return Boolean.TRUE.equals(requests.get(videoId));
-              }
-          }
-          '''
-          (root / (shared + 'spoof/ShortsRequestTracker.java')).write_text(tracker)
-
-          spoof = shared + 'spoof/SpoofVideoStreamsPatch.java'
-          replace(spoof, '    public static ClientType getPreferredClient() {',
-          '''    private static boolean bypassShort(String videoId) {
+          
+          base = 'extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/'
+          replace(base + 'ShortsRequestTracker.java',
+              '    private ShortsRequestTracker() { }',
+              '''    private ShortsRequestTracker() { }
+              private static volatile boolean currentShort;
+          
+              public static boolean isCurrentShort() { return currentShort; }
+          
+              public static synchronized void recordPlayback(String videoId, String parameters, boolean openingOrPlaying) {
+                  record(videoId, parameters);
+                  if (videoId == null || videoId.isEmpty() || parameters == null || parameters.isEmpty()) return;
+                  boolean shortRequest = parameters.startsWith("8AEB");
+                  // Follow Morphe's existing active-video classification rule.
+                  // Shorts background preloads must not replace the active playback context.
+                  if (!shortRequest || openingOrPlaying) currentShort = shortRequest;
+              }''')
+          replace('extensions/youtube/src/main/java/app/morphe/extension/youtube/patches/spoof/SpoofVideoStreamsPatch.java',
+              'ShortsRequestTracker.record(videoId, parameters);',
+              'ShortsRequestTracker.recordPlayback(videoId, parameters, openingOrPlaying);')
+          p = root / (base + 'SpoofVideoStreamsPatch.java')
+          s = p.read_text()
+          s = s.replace('    public static boolean isSpoofingEnabled() {\n        return SPOOF_VIDEO_STREAMS;\n    }',
+          '''    private static boolean bypassCurrentShort() {
                   return SharedYouTubeSettings.SPOOF_VIDEO_STREAMS_SKIP_SHORTS.get()
-                          && ShortsRequestTracker.isShort(videoId);
+                          && ShortsRequestTracker.isCurrentShort();
               }
-
-              public static ClientType getPreferredClient() {''')
-          replace(spoof, '                String path = innerTubeRequestBuilder.build().getPath();',
-          '''                Uri requestUri = innerTubeRequestBuilder.build();
-                          if (bypassShort(requestUri.getQueryParameter("id"))) return innerTubeRequestBuilder;
-                          String path = requestUri.getPath();''')
-          replace(spoof, '                var originalUri = Uri.parse(originalUrlString);',
-          '''                var originalUri = Uri.parse(originalUrlString);
-                          if (bypassShort(originalUri.getQueryParameter("id"))) return originalUrlString;''')
-          replace(spoof, '                boolean isInline = "1".equals(uri.getQueryParameter("inline"));',
-          '''                if (bypassShort(id)) return;
-                          boolean isInline = "1".equals(uri.getQueryParameter("inline"));''')
-          for signature, result in [('public static byte[] getStreamingData(String videoId)', 'null'),
-                                    ('public static byte[] getPlayerConfig(String videoId)', 'null'),
-                                    ('public static boolean hasAndroidMedia(String videoId)', 'false')]:
-              replace(spoof, '    ' + signature + ' {',
-                      '    ' + signature + ' {\n        if (bypassShort(videoId)) return ' + result + ';')
-          replace(spoof, '        if (SPOOF_VIDEO_STREAMS) {\n            try {\n                final int methodPost = 2;',
-          '''        if (SPOOF_VIDEO_STREAMS) {
-                      try {
-                          // Native Android streams need their original Android request body.
-                          // c=ANDROID_VR and all other spoof clients still use the existing path.
-                          if (SharedYouTubeSettings.SPOOF_VIDEO_STREAMS_SKIP_SHORTS.get()
-                                  && "ANDROID".equals(uri.getQueryParameter("c"))) return postData;
-                          final int methodPost = 2;''')
-
-          yt = 'extensions/youtube/src/main/java/app/morphe/extension/youtube/patches/spoof/SpoofVideoStreamsPatch.java'
-          replace(yt, '    public static final class SpoofClientAv1Availability',
-          '''    /** Registered at player parameter construction, before network fetching. */
-              public static String classifyRequest(String parameters, String videoId, boolean openingOrPlaying) {
-                  app.morphe.extension.shared.spoof.ShortsRequestTracker.record(videoId, parameters);
-                  return parameters;
-              }
-
-              public static final class SpoofClientAv1Availability''')
-          kt = 'patches/src/main/kotlin/app/morphe/patches/youtube/misc/spoof/SpoofVideoStreamsPatch.kt'
-          replace(kt, 'import app.morphe.patches.youtube.shared.YouTubeActivityOnCreateFingerprint',
-          '''import app.morphe.patches.youtube.shared.YouTubeActivityOnCreateFingerprint
-          import app.morphe.patches.youtube.video.playerresponse.Hook
-          import app.morphe.patches.youtube.video.playerresponse.addPlayerResponseMethodHook
-          import app.morphe.patches.youtube.video.playerresponse.playerResponseMethodHookPatch''')
-          replace(kt, '            versionCheckPatch\n', '            versionCheckPatch,\n            playerResponseMethodHookPatch\n')
-          replace(kt, '    executeBlock = {\n',
-          '''    executeBlock = {
-                  addPlayerResponseMethodHook(Hook.ProtoBufferParameterBeforeVideoId(
-                      "Lapp/morphe/extension/youtube/patches/spoof/SpoofVideoStreamsPatch;->classifyRequest(Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/String;"
-                  ))
-          ''')
-          replace(kt, '                    ListPreference("morphe_spoof_video_streams_client_type"),',
-          '''                    SwitchPreference("morphe_spoof_video_streams_skip_shorts", summary = true),
-                              ListPreference("morphe_spoof_video_streams_client_type"),''')
-          replace('patches/src/main/resources/addresources/values/youtube/strings.xml', '</resources>',
-          '''    <string name="morphe_spoof_video_streams_skip_shorts_title">Skip stream spoofing for Shorts (experimental)</string>
-              <string name="morphe_spoof_video_streams_skip_shorts_summary">Use native streams for identified Shorts requests. Restart after changing. Turn off if Shorts stop playing.</string>
-          </resources>''')
-          replace('gradle.properties', 'version = 1.46.0', 'version = 1.46.0-shorts-experimental.1')
-          print('Applied experimental Shorts changes to Morphe 1.46.0')
+          
+              public static boolean isSpoofingEnabled() {
+                  return SPOOF_VIDEO_STREAMS && !bypassCurrentShort();
+              }''')
+          for name in ['fixHLSCurrentTime', 'useMediaFetchHotConfigReplacement',
+                       'usePlaybackStartFeatureFlag', 'useMediaSessionFeatureFlag']:
+              signature = '    public static boolean ' + name + '(boolean original) {'
+              assert s.count(signature) == 1, name
+              s = s.replace(signature, signature + '\n        if (bypassCurrentShort()) return original;')
+          # Reel response is specifically the Shorts endpoint. It can be evaluated before
+          # the active-video hook, so preserve its native value for the entire experiment.
+          signature = '    public static boolean useReelItemWatchResponseFeatureFlag(boolean original) {'
+          assert s.count(signature) == 1
+          s = s.replace(signature, signature + '\n        if (SharedYouTubeSettings.SPOOF_VIDEO_STREAMS_SKIP_SHORTS.get()) return original;')
+          s = s.replace('return SPOOF_VIDEO_STREAMS && !StreamingDataRequest.getLastSpoofedClientUseSABR();',
+                        'return isSpoofingEnabled() && !StreamingDataRequest.getLastSpoofedClientUseSABR();')
+          # ID-less request builders do not provide enough data for the original per-ID rule.
+          s = s.replace('if (bypassShort(requestUri.getQueryParameter("id"))) return innerTubeRequestBuilder;',
+          '''String requestId = requestUri.getQueryParameter("id");
+                          if (bypassShort(requestId) || (requestId == null && bypassCurrentShort())) return innerTubeRequestBuilder;''')
+          s = s.replace('if (bypassShort(originalUri.getQueryParameter("id"))) return originalUrlString;',
+          '''String requestId = originalUri.getQueryParameter("id");
+                          if (bypassShort(requestId) || (requestId == null && bypassCurrentShort())) return originalUrlString;''')
+          s = s.replace('&& "ANDROID".equals(uri.getQueryParameter("c"))) return postData;',
+          '''&& ("ANDROID".equals(uri.getQueryParameter("c"))
+                                      || (uri.getQueryParameter("c") == null && bypassCurrentShort()))) return postData;''')
+          p.write_text(s)
+          replace('gradle.properties', 'version = 1.46.0-shorts-experimental.1',
+                  'version = 1.46.0-shorts-experimental.2')
+          print('Applied experimental v2: native Shorts playback flags and SABR')
           PY
-      - name: Check request classification
+      - name: Check v2 request classification
         shell: bash
         run: |
-          cat > ShortsRequestTrackerTest.java <<'JAVA'
+          cat > ShortsV2Test.java <<'JAVA'
           import app.morphe.extension.shared.spoof.ShortsRequestTracker;
-
-          public class ShortsRequestTrackerTest {
-              private static void check(boolean condition) {
-                  if (!condition) throw new AssertionError();
-              }
-              public static void main(String[] args) throws Exception {
-                  check(!ShortsRequestTracker.isShort("unknown"));
-                  ShortsRequestTracker.record("short", "8AEBtest");
-                  ShortsRequestTracker.record("long", "regular");
-                  check(ShortsRequestTracker.isShort("short"));
+          public class ShortsV2Test {
+              static void check(boolean value) { if (!value) throw new AssertionError(); }
+              public static void main(String[] args) {
+                  ShortsRequestTracker.recordPlayback("long", "regular", false);
+                  check(!ShortsRequestTracker.isCurrentShort());
+                  ShortsRequestTracker.recordPlayback("preload", "8AEB", false);
+                  check(!ShortsRequestTracker.isCurrentShort());
+                  check(ShortsRequestTracker.isShort("preload"));
+                  ShortsRequestTracker.recordPlayback("opened", "8AEB", true);
+                  check(ShortsRequestTracker.isCurrentShort());
                   check(!ShortsRequestTracker.isShort("long"));
-                  // Background preloads must not flip unrelated long-form IDs.
-                  for (int i = 0; i < 100; i++) ShortsRequestTracker.record("preload" + i, "8AEB");
-                  check(!ShortsRequestTracker.isShort("long"));
-                  check(ShortsRequestTracker.isShort("short"));
-                  // The same video opened in a normal player must resume spoofing.
-                  ShortsRequestTracker.record("short", "regular");
-                  check(!ShortsRequestTracker.isShort("short"));
-                  ShortsRequestTracker.record("short", "8AEB");
-                  ShortsRequestTracker.record("short", null);
-                  check(!ShortsRequestTracker.isShort("short"));
-                  ShortsRequestTracker.record(null, "8AEB");
-                  ShortsRequestTracker.record("", "8AEB");
-                  Thread a = new Thread(() -> { for (int i = 0; i < 1000; i++) ShortsRequestTracker.record("a" + i, "8AEB"); });
-                  Thread b = new Thread(() -> { for (int i = 0; i < 1000; i++) ShortsRequestTracker.record("b" + i, "regular"); });
-                  a.start(); b.start(); a.join(); b.join();
-                  ShortsRequestTracker.record("current-short", "8AEB");
-                  ShortsRequestTracker.record("current-long", "regular");
-                  check(ShortsRequestTracker.isShort("current-short"));
-                  check(!ShortsRequestTracker.isShort("current-long"));
-                  var field = ShortsRequestTracker.class.getDeclaredField("requests");
-                  field.setAccessible(true);
-                  check(((java.util.Map<?, ?>) field.get(null)).size() <= 512);
-                  System.out.println("Shorts request classification checks passed");
+                  ShortsRequestTracker.recordPlayback("opened", "regular", false);
+                  check(!ShortsRequestTracker.isCurrentShort());
+                  check(!ShortsRequestTracker.isShort("opened"));
+                  System.out.println("V2 classification checks passed");
               }
           }
           JAVA
-          javac -d test-classes morphe-patches/extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/ShortsRequestTracker.java ShortsRequestTrackerTest.java
-          java -cp test-classes ShortsRequestTrackerTest
+          javac -d test-classes morphe-patches/extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/ShortsRequestTracker.java ShortsV2Test.java
+          java -cp test-classes ShortsV2Test
       - name: Build patch bundle
         working-directory: morphe-patches
         env:
@@ -186,7 +149,7 @@ jobs:
       - name: Upload patch bundle
         uses: actions/upload-artifact@v7
         with:
-          name: morphe-shorts-experimental
+          name: morphe-shorts-experimental-v2
           path: morphe-patches/patches/build/libs/*.mpp
           if-no-files-found: error
           retention-days: 14
