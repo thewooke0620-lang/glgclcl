@@ -1,4 +1,4 @@
-name: Build Shorts autoplay button v4
+name: Build Shorts autoplay button v6
 on:
   workflow_dispatch:
 permissions:
@@ -310,6 +310,93 @@ jobs:
           replace('gradle.properties', 'version = 1.46.0-shorts-experimental.3', 'version = 1.46.0-shorts-experimental.4')
           print('Added foreground Shorts autoplay switch')
           PY
+      - name: Fix button initialization
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('morphe-patches')
+          def replace(path, old, new):
+              p=root/path
+              s=p.read_text()
+              assert s.count(old)==1,(path,old)
+              p.write_text(s.replace(old,new))
+          base='extensions/youtube/src/main/java/app/morphe/extension/youtube/'
+          replace(base+'patches/ShortsAutoplayButton.java',
+              '    private static volatile boolean enabled;',
+              '    public static boolean isPatchIncluded() { return false; }')
+          replace(base+'patches/ShortsAutoplayButton.java',
+              '        enabled = true;\n        updateVisibility();',
+              '        updateVisibility();')
+          replace(base+'patches/ShortsAutoplayButton.java',
+              '        if (!enabled) return;',
+              '        if (!isPatchIncluded()) return;')
+          replace(base+'patches/PlayerTypeHookPatch.java',
+              '                ShortsPlayerState.setOpen(true);',
+              '''                ShortsPlayerState.setOpen(true);
+                          // Wait for the newly attached Shorts layout to finish attaching.
+                          if (v != null) v.post(ShortsAutoplayButton::updateVisibility);''')
+          patch='patches/src/main/kotlin/app/morphe/patches/youtube/layout/shortsautoplay/ShortsAutoplayPatch.kt'
+          replace(patch,'import app.morphe.util.findInstructionIndicesReversedOrThrow',
+              'import app.morphe.util.setExtensionIsPatchIncluded\nimport app.morphe.util.findInstructionIndicesReversedOrThrow')
+          replace(patch,'    execute {',
+              '''    execute {
+                  setExtensionIsPatchIncluded("Lapp/morphe/extension/youtube/patches/ShortsAutoplayButton;")''')
+          replace('gradle.properties','version = 1.46.0-shorts-experimental.4','version = 1.46.0-shorts-experimental.5')
+          print('v5: initialize button when Shorts view attaches, with patch inclusion guard')
+          PY
+      - name: Use compact toolbar toggle
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('morphe-patches')
+          def replace(path,old,new):
+           p=root/path;s=p.read_text();assert s.count(old)==1,(path,old);p.write_text(s.replace(old,new))
+          p='extensions/youtube/src/main/java/app/morphe/extension/youtube/patches/ShortsAutoplayButton.java'
+          replace(p,'import android.graphics.drawable.GradientDrawable;', '''import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.graphics.ColorFilter;
+          import android.graphics.PixelFormat;
+          import android.graphics.drawable.Drawable;''')
+          replace(p,'            view.setTextSize(12);','            view.setTextSize(9);\n            view.setCompoundDrawablePadding(dp(activity, 2));')
+          replace(p,'            view.setPadding(dp(activity, 10), 0, dp(activity, 10), 0);','            view.setPadding(0, dp(activity, 7), 0, dp(activity, 5));')
+          replace(p,'                    FrameLayout.LayoutParams.WRAP_CONTENT, dp(activity, 48), Gravity.TOP | Gravity.RIGHT);','                    dp(activity, 48), dp(activity, 48), Gravity.TOP | Gravity.RIGHT);')
+          replace(p,'            params.rightMargin = dp(activity, 12);','            params.rightMargin = dp(activity, 104);')
+          replace(p,'            params.topMargin = dp(activity, 64);','            params.topMargin = dp(activity, 4);')
+          replace(p,'                int top = dp(activity, 64) + safeTop;','                int top = dp(activity, 4) + safeTop;')
+          replace(p,'        view.setText(on ? "자동재생 ON" : "자동재생 OFF");','        view.setText(on ? "ON" : "OFF");')
+          replace(p,'''        GradientDrawable background = new GradientDrawable();
+                  background.setColor(on ? 0xCC146B42 : 0xBB202020);
+                  background.setCornerRadius(24 * view.getResources().getDisplayMetrics().density);
+                  view.setBackground(background);''','''        float density = view.getResources().getDisplayMetrics().density;
+                  Drawable icon = new ToggleIcon(on);
+                  icon.setBounds(0, 0, Math.round(24 * density), Math.round(16 * density));
+                  view.setCompoundDrawables(null, icon, null, null);
+                  view.setBackgroundColor(Color.TRANSPARENT);''')
+          replace(p,'    private static void refresh(TextView view) {','''    /** Small white switch, matching the toolbar icons; touch target stays 48dp. */
+              private static final class ToggleIcon extends Drawable {
+                  private final boolean on;
+                  private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  ToggleIcon(boolean on) { this.on = on; paint.setColor(Color.WHITE); }
+                  @Override public void draw(Canvas canvas) {
+                      canvas.save();
+                      canvas.translate(getBounds().left, getBounds().top);
+                      canvas.scale(getBounds().width() / 24f, getBounds().height() / 16f);
+                      paint.setStyle(Paint.Style.STROKE);
+                      paint.setStrokeWidth(1.6f);
+                      canvas.drawRoundRect(1, 2, 23, 14, 6, 6, paint);
+                      paint.setStyle(Paint.Style.FILL);
+                      canvas.drawCircle(on ? 17 : 7, 8, 3.6f, paint);
+                      canvas.restore();
+                  }
+                  @Override public void setAlpha(int alpha) { paint.setAlpha(alpha); invalidateSelf(); }
+                  @Override public void setColorFilter(ColorFilter filter) { paint.setColorFilter(filter); invalidateSelf(); }
+                  @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
+              }
+          
+              private static void refresh(TextView view) {''')
+          replace('gradle.properties','version = 1.46.0-shorts-experimental.5','version = 1.46.0-shorts-experimental.6')
+          print('v6: compact white ON/OFF icon beside search')
+          PY
       - name: Build patch bundle
         working-directory: morphe-patches
         env:
@@ -320,7 +407,7 @@ jobs:
       - name: Upload patch bundle
         uses: actions/upload-artifact@v7
         with:
-          name: morphe-shorts-autoplay-v4
+          name: morphe-shorts-autoplay-v6
           path: morphe-patches/patches/build/libs/*.mpp
           if-no-files-found: error
           retention-days: 14
