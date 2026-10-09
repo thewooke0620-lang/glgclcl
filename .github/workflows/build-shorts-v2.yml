@@ -1,4 +1,4 @@
-name: Build Shorts autoplay button v7
+name: Build Shorts autoplay button v8
 on:
   workflow_dispatch:
 permissions:
@@ -443,6 +443,106 @@ jobs:
           replace('gradle.properties','version = 1.46.0-shorts-experimental.6','version = 1.46.0-shorts-experimental.7')
           print('v7: design 2 circular autoplay icon; OFF slash; preserved 48dp touch target')
           PY
+      - name: Align with native Shorts toolbar
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('morphe-patches')
+          def replace(path,old,new):
+           p=root/path;s=p.read_text();assert s.count(old)==1,(path,old);p.write_text(s.replace(old,new))
+          p='extensions/youtube/src/main/java/app/morphe/extension/youtube/patches/ShortsAutoplayButton.java'
+          s=(root/p).read_text().replace('android.widget.TextView','android.widget.ImageButton').replace('TextView','ImageButton')
+          s=s.replace('import android.view.View;','import android.view.View;\nimport android.view.ViewGroup;\nimport android.widget.ImageView;\nimport java.util.Locale;')
+          s=s.replace('''            view.setTextColor(Color.WHITE);
+                      view.setTextSize(0);
+                      view.setIncludeFontPadding(false);
+                      view.setCompoundDrawablePadding(0);
+                      view.setGravity(Gravity.CENTER);
+                      view.setPadding(0, dp(activity, 12), 0, dp(activity, 12));''','''            // Center the drawable directly: no TextView baseline or font metrics.
+                      view.setScaleType(ImageView.ScaleType.CENTER);
+                      view.setPadding(0, 0, 0, 0);''')
+          s=s.replace('params.rightMargin = dp(activity, 104);','params.rightMargin = dp(activity, 96);').replace('params.topMargin = dp(activity, 4);','params.topMargin = 0;')
+          old='''                int top = dp(activity, 4) + safeTop;
+                          if (layout.topMargin != top) {
+                              layout.topMargin = top;
+                              view.setLayoutParams(layout);
+                          }'''
+          new='''                int top = safeTop;
+                          int right = dp(activity, 96);
+                          View search = findToolbarControl(root, view, true, location, safeTop, activity);
+                          if (search != null) {
+                              int[] searchPosition = new int[2];
+                              search.getLocationOnScreen(searchPosition);
+                              float searchX = searchPosition[0] - location[0] + search.getWidth() / 2f;
+                              float searchY = searchPosition[1] - location[1] + search.getHeight() / 2f;
+                              float spacing = dp(activity, 48);
+                              View menu = findToolbarControl(root, view, false, location, safeTop, activity);
+                              if (menu != null) {
+                                  int[] menuPosition = new int[2];
+                                  menu.getLocationOnScreen(menuPosition);
+                                  float menuX = menuPosition[0] - location[0] + menu.getWidth() / 2f;
+                                  float menuY = menuPosition[1] - location[1] + menu.getHeight() / 2f;
+                                  float measured = menuX - searchX;
+                                  if (measured >= dp(activity, 32) && measured <= dp(activity, 80)
+                                          && Math.abs(menuY - searchY) <= dp(activity, 12)) spacing = measured;
+                              }
+                              top = Math.round(searchY - layout.height / 2f);
+                              right = Math.round(root.getWidth() - (searchX - spacing) - layout.width / 2f);
+                          }
+                          if (layout.topMargin != top || layout.rightMargin != right) {
+                              layout.topMargin = top;
+                              layout.rightMargin = right;
+                              view.setLayoutParams(layout);
+                          }'''
+          assert s.count(old)==1;s=s.replace(old,new)
+          s=s.replace('        view.setText("");\n','').replace('        view.setCompoundDrawables(null, icon, null, null);','        view.setImageDrawable(icon);')
+          needle='    /** White autoplay icon: circular arrow and play triangle; OFF adds a slash. */'
+          helper='''    /** Locate a visible native control only in the upper-right Shorts toolbar. */
+              private static View findToolbarControl(View node, View own, boolean search,
+                      int[] rootPosition, int safeTop, Activity activity) {
+                  if (node == own || node.getVisibility() != View.VISIBLE) return null;
+                  if (node.getWidth() > 0 && node.getHeight() > 0) {
+                      String id = "";
+                      if (node.getId() != View.NO_ID) {
+                          try { id = node.getResources().getResourceEntryName(node.getId()).toLowerCase(Locale.ROOT); }
+                          catch (android.content.res.Resources.NotFoundException ignored) { }
+                      }
+                      CharSequence description = node.getContentDescription();
+                      String text = description == null ? "" : description.toString().toLowerCase(Locale.ROOT);
+                      boolean matches = search
+                              ? id.contains("search") || text.contains("search") || text.contains("검색")
+                              : id.contains("overflow") || id.contains("menu")
+                                      || text.contains("more options") || text.contains("더보기")
+                                      || text.contains("옵션 더보기");
+                      if (matches && node.getWidth() <= dp(activity, 80) && node.getHeight() <= dp(activity, 80)) {
+                          int[] position = new int[2];
+                          node.getLocationOnScreen(position);
+                          float x = position[0] - rootPosition[0] + node.getWidth() / 2f;
+                          float y = position[1] - rootPosition[1] + node.getHeight() / 2f;
+                          View root = own.getParent() instanceof View ? (View) own.getParent() : null;
+                          if (root != null && x > root.getWidth() * 0.55f
+                                  && y >= safeTop && y <= safeTop + dp(activity, 96)) return node;
+                      }
+                  }
+                  if (node instanceof ViewGroup) {
+                      ViewGroup group = (ViewGroup) node;
+                      for (int i = group.getChildCount() - 1; i >= 0; i--) {
+                          View found = findToolbarControl(group.getChildAt(i), own, search, rootPosition, safeTop, activity);
+                          if (found != null) return found;
+                      }
+                  }
+                  return null;
+              }
+          
+          '''
+          assert s.count(needle)==1;s=s.replace(needle,helper+needle)
+          s=s.replace('        private final boolean on;', '        private final boolean on;\n        private final int size;')
+          s=s.replace('        ToggleIcon(boolean on) { this.on = on; paint.setColor(Color.WHITE); }', '        ToggleIcon(boolean on, int size) { this.on = on; this.size = size; paint.setColor(Color.WHITE); }\n        @Override public int getIntrinsicWidth() { return size; }\n        @Override public int getIntrinsicHeight() { return size; }')
+          s=s.replace('Drawable icon = new ToggleIcon(on);', 'Drawable icon = new ToggleIcon(on, Math.round(24 * density));')
+          (root/p).write_text(s)
+          replace('gradle.properties','version = 1.46.0-shorts-experimental.7','version = 1.46.0-shorts-experimental.8')
+          print('v8: native search-center alignment, measured menu spacing, centered ImageButton')
+          PY
       - name: Build patch bundle
         working-directory: morphe-patches
         env:
@@ -453,7 +553,7 @@ jobs:
       - name: Upload patch bundle
         uses: actions/upload-artifact@v7
         with:
-          name: morphe-shorts-autoplay-v7
+          name: morphe-shorts-autoplay-v8
           path: morphe-patches/patches/build/libs/*.mpp
           if-no-files-found: error
           retention-days: 14
