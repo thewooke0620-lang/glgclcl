@@ -1,4 +1,4 @@
-name: Build experimental Shorts patch v2
+name: Build Shorts autoplay button v4
 on:
   workflow_dispatch:
 permissions:
@@ -139,6 +139,177 @@ jobs:
           JAVA
           javac -d test-classes morphe-patches/extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/ShortsRequestTracker.java ShortsV2Test.java
           java -cp test-classes ShortsV2Test
+      - name: Correct Shorts startup requests v3
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('morphe-patches')
+          def replace(path, old, new):
+              p = root / path
+              s = p.read_text()
+              assert s.count(old) == 1, (path, old)
+              p.write_text(s.replace(old, new))
+          shared = 'extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/SpoofVideoStreamsPatch.java'
+          replace(shared, '    private static boolean bypassCurrentShort() {',
+          '''    private static volatile java.util.function.BooleanSupplier shortsUiResolver = () -> false;
+          
+              public static void setShortsUiResolver(java.util.function.BooleanSupplier resolver) {
+                  shortsUiResolver = java.util.Objects.requireNonNull(resolver);
+              }
+          
+              private static boolean bypassCurrentShort() {''')
+          replace(shared, '                && ShortsRequestTracker.isCurrentShort();',
+              '                && (ShortsRequestTracker.isCurrentShort() || shortsUiResolver.getAsBoolean());')
+          for result, label in [('innerTubeRequestBuilder', 'get_watch'), ('originalUrlString', 'initplayback')]:
+              replace(shared,
+                  '                if (bypassShort(requestId) || (requestId == null && bypassCurrentShort())) return ' + result + ';',
+                  '                if (bypassShort(requestId) || bypassCurrentShort()) {\n'
+                  '                    Logger.printDebug(() -> "Shorts v3: preserving native ' + label + ' request");\n'
+                  '                    return ' + result + ';\n                }')
+          yt = 'extensions/youtube/src/main/java/app/morphe/extension/youtube/patches/spoof/SpoofVideoStreamsPatch.java'
+          replace(yt, '    public static void setClientOrderToUse() {',
+          '''    public static void setClientOrderToUse() {
+                  app.morphe.extension.shared.spoof.SpoofVideoStreamsPatch.setShortsUiResolver(
+                          () -> app.morphe.extension.youtube.shared.ShortsPlayerState.isOpen()
+                                  && app.morphe.extension.youtube.shared.PlayerType.getCurrent().isNoneOrHidden());''')
+          replace('gradle.properties', 'version = 1.46.0-shorts-experimental.2',
+                  'version = 1.46.0-shorts-experimental.3')
+          print('Applied v3 native startup request bypass; playback verification pending')
+          PY
+      - name: Add Shorts autoplay button
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('morphe-patches')
+          def replace(path, old, new):
+              p = root / path
+              s = p.read_text()
+              assert s.count(old) == 1, (path, old)
+              p.write_text(s.replace(old, new))
+          base = 'extensions/youtube/src/main/java/app/morphe/extension/youtube/'
+          (root / base / 'patches/ShortsAutoplayButton.java').write_text('''package app.morphe.extension.youtube.patches;
+          
+          import android.app.Activity;
+          import android.graphics.Color;
+          import android.graphics.drawable.GradientDrawable;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.WindowInsets;
+          import android.widget.FrameLayout;
+          import android.widget.TextView;
+          import java.lang.ref.WeakReference;
+          import app.morphe.extension.shared.Utils;
+          import app.morphe.extension.youtube.settings.Settings;
+          import app.morphe.extension.youtube.shared.PlayerType;
+          import app.morphe.extension.youtube.shared.ShortsPlayerState;
+          
+          /** Foreground Shorts auto-advance switch. No timers or synthetic swipes. */
+          public final class ShortsAutoplayButton {
+              private static volatile boolean enabled;
+              private static WeakReference<TextView> button = new WeakReference<>(null);
+          
+              private ShortsAutoplayButton() {}
+          
+              public static void activate() {
+                  enabled = true;
+                  updateVisibility();
+              }
+          
+              public static void updateVisibility() {
+                  if (!enabled) return; // No UI when the Shorts autoplay patch is not selected.
+                  Utils.runOnMainThread(ShortsAutoplayButton::updateOnMainThread);
+              }
+          
+              private static int dp(Activity activity, int value) {
+                  return Math.round(value * activity.getResources().getDisplayMetrics().density);
+              }
+          
+              private static void updateOnMainThread() {
+                  Activity activity = Utils.getActivity();
+                  TextView existing = button.get();
+                  boolean show = activity != null && !activity.isFinishing()
+                          && ShortsPlayerState.isOpen() && PlayerType.getCurrent().isNoneOrHidden()
+                          && !activity.isInPictureInPictureMode();
+                  if (!show) {
+                      if (existing != null) existing.setVisibility(View.GONE);
+                      return;
+                  }
+                  View content = activity.findViewById(android.R.id.content);
+                  if (!(content instanceof FrameLayout)) return;
+                  FrameLayout root = (FrameLayout) content;
+                  if (existing == null || existing.getParent() != root) {
+                      if (existing != null && existing.getParent() instanceof FrameLayout) {
+                          ((FrameLayout) existing.getParent()).removeView(existing);
+                      }
+                      TextView view = new TextView(activity);
+                      view.setTextColor(Color.WHITE);
+                      view.setTextSize(12);
+                      view.setGravity(Gravity.CENTER);
+                      view.setPadding(dp(activity, 10), 0, dp(activity, 10), 0);
+                      view.setElevation(dp(activity, 32));
+                      view.setClickable(true);
+                      view.setFocusable(true);
+                      FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                              FrameLayout.LayoutParams.WRAP_CONTENT, dp(activity, 48), Gravity.TOP | Gravity.RIGHT);
+                      params.rightMargin = dp(activity, 12);
+                      params.topMargin = dp(activity, 64);
+                      root.addView(view, params);
+                      button = new WeakReference<>(view);
+                      view.setOnClickListener(clicked -> {
+                          Settings.SHORTS_AUTOPLAY.save(!Settings.SHORTS_AUTOPLAY.get());
+                          refresh(view);
+                          view.announceForAccessibility(view.getContentDescription());
+                      });
+                      view.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
+                          boolean visible = ShortsPlayerState.isOpen()
+                                  && PlayerType.getCurrent().isNoneOrHidden()
+                                  && !activity.isInPictureInPictureMode();
+                          view.setVisibility(visible ? View.VISIBLE : View.GONE);
+                          WindowInsets insets = root.getRootWindowInsets();
+                          int[] location = new int[2];
+                          root.getLocationOnScreen(location);
+                          int safeTop = insets == null ? 0 : Math.max(0, insets.getSystemWindowInsetTop() - location[1]);
+                          FrameLayout.LayoutParams layout = (FrameLayout.LayoutParams) view.getLayoutParams();
+                          int top = dp(activity, 64) + safeTop;
+                          if (layout.topMargin != top) {
+                              layout.topMargin = top;
+                              view.setLayoutParams(layout);
+                          }
+                      });
+                      existing = view;
+                  }
+                  refresh(existing);
+                  existing.setVisibility(View.VISIBLE);
+                  existing.bringToFront();
+              }
+          
+              private static void refresh(TextView view) {
+                  boolean on = Settings.SHORTS_AUTOPLAY.get();
+                  view.setText(on ? "자동재생 ON" : "자동재생 OFF");
+                  view.setContentDescription(on ? "쇼츠 자동 넘김 켜짐. 눌러서 끄기" : "쇼츠 자동 넘김 꺼짐. 눌러서 켜기");
+                  view.setSelected(on);
+                  GradientDrawable background = new GradientDrawable();
+                  background.setColor(on ? 0xCC146B42 : 0xBB202020);
+                  background.setCornerRadius(24 * view.getResources().getDisplayMetrics().density);
+                  view.setBackground(background);
+              }
+          }
+          ''')
+          replace(base + 'patches/ShortsAutoplayPatch.java',
+                  '    public static Enum<?> changeShortsRepeatBehavior(Enum<?> original) {',
+                  '    public static Enum<?> changeShortsRepeatBehavior(Enum<?> original) {\n        ShortsAutoplayButton.activate();')
+          replace(base + 'shared/ShortsPlayerState.kt', '                onChange(open)',
+                  '                onChange(open)\n                app.morphe.extension.youtube.patches.ShortsAutoplayButton.updateVisibility()')
+          replace(base + 'shared/PlayerType.kt', '                    onChange(type)',
+                  '                    onChange(type)\n                    app.morphe.extension.youtube.patches.ShortsAutoplayButton.updateVisibility()')
+          p = 'patches/src/main/kotlin/app/morphe/patches/youtube/layout/shortsautoplay/ShortsAutoplayPatch.kt'
+          replace(p, 'import app.morphe.patches.youtube.misc.extension.sharedExtensionPatch',
+                  'import app.morphe.patches.youtube.misc.extension.sharedExtensionPatch\nimport app.morphe.patches.youtube.misc.playertype.playerTypeHookPatch')
+          replace(p, '        sharedExtensionPatch,', '        sharedExtensionPatch,\n        playerTypeHookPatch,')
+          replace('gradle.properties', 'version = 1.46.0-shorts-experimental.3', 'version = 1.46.0-shorts-experimental.4')
+          print('Added foreground Shorts autoplay switch')
+          PY
       - name: Build patch bundle
         working-directory: morphe-patches
         env:
@@ -149,7 +320,7 @@ jobs:
       - name: Upload patch bundle
         uses: actions/upload-artifact@v7
         with:
-          name: morphe-shorts-experimental-v2
+          name: morphe-shorts-autoplay-v4
           path: morphe-patches/patches/build/libs/*.mpp
           if-no-files-found: error
           retention-days: 14
