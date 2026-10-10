@@ -1,4 +1,4 @@
-name: Build Shorts Working Mode v10
+name: Build Shorts Walking Mode v11
 on:
   workflow_dispatch:
 permissions:
@@ -693,6 +693,102 @@ jobs:
           replace('gradle.properties','version = 1.46.0-shorts-experimental.9','version = 1.46.0-shorts-experimental.10')
           print('v10: native Shorts flyout Working Mode switch, live background settings')
           PY
+      - name: Use actual regular player in Walking Mode v11
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('morphe-patches')
+          def replace(path,old,new):
+           p=root/path;s=p.read_text();assert s.count(old)==1,(path,old);p.write_text(s.replace(old,new))
+          base='extensions/youtube/src/main/java/app/morphe/extension/youtube/'
+          replace(base+'settings/Settings.java','    public static final BooleanSetting DISABLE_SHORTS_BACKGROUND_PLAYBACK =',
+           '    public static final BooleanSetting WORKING_MODE = new BooleanSetting("morphe_shorts_working_mode", FALSE);\n    public static final BooleanSetting DISABLE_SHORTS_BACKGROUND_PLAYBACK =')
+          (root/base/'patches/WorkingModePatch.java').write_text('''package app.morphe.extension.youtube.patches;
+
+          import app.morphe.extension.shared.Logger;
+          import app.morphe.extension.shared.Utils;
+          import app.morphe.extension.youtube.settings.Settings;
+          import app.morphe.extension.youtube.shared.PlayerType;
+          import app.morphe.extension.youtube.shared.ShortsPlayerState;
+
+          /** Walking Mode uses YouTube's actual watch player and its media session. */
+          public final class WorkingModePatch {
+              private WorkingModePatch() {}
+              public static boolean isPatchIncluded() { return false; }
+              public static boolean isEnabled() {
+                  return isPatchIncluded() && Settings.WORKING_MODE.get();
+              }
+              public static void setEnabled(boolean enabled) {
+                  Settings.WORKING_MODE.save(enabled);
+                  if (enabled) Settings.REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS.save(true);
+                  Settings.DISABLE_SHORTS_BACKGROUND_PLAYBACK.save(!enabled);
+                  if (!enabled || !ShortsPlayerState.isOpen()
+                          || !PlayerType.getCurrent().isNoneOrHidden()) return;
+
+                  // Capture the active ID before dismissing the menu/player. Never use preload IDs.
+                  final String videoId = VideoInformation.getVideoId();
+                  if (videoId == null || !videoId.matches("[A-Za-z0-9_-]{11}")) {
+                      Utils.showToastShort("워킹 모드 켜짐 · 다음 쇼츠부터 일반 플레이어로 재생");
+                      return;
+                  }
+                  final long second = Math.max(0, VideoInformation.getVideoTime() / 1000);
+                  // This foreground switch intentionally changes the actual player, not its UI state enum.
+                  Utils.runOnMainThreadDelayed(() -> {
+                      if (!isEnabled()) return;
+                      Logger.printDebug(() -> "WorkingMode v11: handoff to regular watch player");
+                      LoadVideoPatch.openVideoIntentWithInternalContext(videoId + "&t=" + second + "s");
+                  }, 150);
+              }
+          }
+          ''')
+          # The usual open-shorts setting explicitly ignores the Shorts navigation tab.
+          # Walking Mode overrides that exception and redirects all detected Shorts intents.
+          p=base+'patches/OpenShortsInRegularPlayerPatch.java'
+          replace(p,'            ShortsPlayerType type = Settings.SHORTS_PLAYER_TYPE.get();',
+           '''            final boolean walking = WorkingModePatch.isEnabled();
+                      ShortsPlayerType type = walking ? ShortsPlayerType.REGULAR_PLAYER : Settings.SHORTS_PLAYER_TYPE.get();''')
+          replace(p,'            if (NavigationBar.NavigationButton.getSelectedNavigationButton() ==',
+           '            if (!walking && NavigationBar.NavigationButton.getSelectedNavigationButton() ==')
+          # Provide an OFF switch in the regular player's settings menu after the handoff.
+          p=base+'patches/utils/FlyoutUtils.java'
+          replace(p,'''        if (WorkingModePatch.isPatchIncluded() && ShortsPlayerState.isOpen()
+                          && PlayerType.getCurrent().isNoneOrHidden()
+                          && flyoutCommentId.isEmpty() && flyoutPostId.isEmpty()
+                          && !allButtonsVideoId.isEmpty()) {''',
+          '''        if (WorkingModePatch.isPatchIncluded()
+                          && ((ShortsPlayerState.isOpen() && PlayerType.getCurrent().isNoneOrHidden())
+                              || (WorkingModePatch.isEnabled() && PlayerFlyoutMenuComponentsFilter.getTopFlyoutMenuVisible()))
+                          && flyoutCommentId.isEmpty() && flyoutPostId.isEmpty()
+                          && !allButtonsVideoId.isEmpty()) {''')
+          replace(p,'toggle.setContentDescription("워킹 모드, 쇼츠 백그라운드 및 잠금 재생 허용");',
+           'toggle.setContentDescription("워킹 모드, 일반 플레이어로 듣기");')
+          replace(p,'                WorkingModePatch.setEnabled(checked);',
+           '''                if (checked) dismissFlyout();
+                          WorkingModePatch.setEnabled(checked);''')
+          # Fallback when the internal player interface has not yet been initialized.
+          p=base+'patches/LoadVideoPatch.java'
+          replace(p,'''            context.startActivity(reloadVideoIntent);
+                  }
+              }
+
+              private static boolean checkDismissPlayerAvailability''',
+          '''            context.startActivity(reloadVideoIntent);
+                  } else {
+                      // Explicit watch URL selects the regular player, even for a Shorts video ID.
+                      openVideoIntent("https://www.youtube.com/watch?v=" + videoIDWithParams, true);
+                  }
+              }
+
+              private static boolean checkDismissPlayerAvailability''')
+          # Always include real-player and internal-load hooks when background patch is selected.
+          p='patches/src/main/kotlin/app/morphe/patches/youtube/misc/backgroundplayback/BackgroundPlaybackPatch.kt'
+          replace(p,'import app.morphe.patches.youtube.layout.flyout.flyoutPatch',
+           'import app.morphe.patches.youtube.layout.shortsplayer.openShortsInRegularPlayerPatch\nimport app.morphe.patches.youtube.layout.flyout.flyoutPatch')
+          replace(p,'        flyoutPatch,','        flyoutPatch,\n        openShortsInRegularPlayerPatch,')
+          replace('gradle.properties','version = 1.46.0-shorts-experimental.10','version = 1.46.0-shorts-experimental.11')
+          print('v11: Walking Mode switches active Shorts to real watch player, including Shorts navigation tab')
+          PY
       - name: Build patch bundle
         working-directory: morphe-patches
         env:
@@ -703,7 +799,7 @@ jobs:
       - name: Upload patch bundle
         uses: actions/upload-artifact@v7
         with:
-          name: morphe-shorts-working-mode-v10
+          name: morphe-shorts-working-mode-v11
           path: morphe-patches/patches/build/libs/*.mpp
           if-no-files-found: error
           retention-days: 14
