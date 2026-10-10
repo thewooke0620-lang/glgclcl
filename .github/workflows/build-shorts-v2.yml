@@ -1,4 +1,4 @@
-name: Build Shorts autoplay button v8
+name: Build Shorts Working Mode v10
 on:
   workflow_dispatch:
 permissions:
@@ -543,6 +543,156 @@ jobs:
           replace('gradle.properties','version = 1.46.0-shorts-experimental.7','version = 1.46.0-shorts-experimental.8')
           print('v8: native search-center alignment, measured menu spacing, centered ImageButton')
           PY
+      - name: Correct Shorts background gate v9 (experimental)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('morphe-patches')
+          def replace(path, old, new):
+              p = root / path
+              s = p.read_text()
+              assert s.count(old) == 1, (path, old)
+              p.write_text(s.replace(old, new))
+          base = 'extensions/youtube/src/main/java/app/morphe/extension/youtube/'
+          p = base + 'patches/BackgroundPlaybackPatch.java'
+          # The shared background gate previously rejected every open Shorts player,
+          # even when the dedicated Shorts background gate allowed it.
+          replace(p, '        if (ShortsPlayerState.isOpen()) {\n            return false;\n        }',
+              '        if (ShortsPlayerState.isOpen()) {\n            return REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS_SHORTS;\n        }')
+          # Preserve stock behavior if the user disables the overall patch.
+          replace(p, '        return REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS_SHORTS;\n    }',
+              '        return REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS\n                ? REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS_SHORTS : original;\n    }')
+          # No forced resume, synthetic media keys, or wake locks: user pause is respected.
+          replace(p, '    private static void handleScreenOff(Context context) {',
+              '    private static void handleScreenOff(Context context) {\n'
+              '        Logger.printDebug(() -> "ShortsLock v9 screenOff: shorts=" + ShortsPlayerState.isOpen()\n'
+              '                + ", player=" + PlayerType.getCurrent() + ", state=" + VideoState.getCurrent()\n'
+              '                + ", background=" + REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS\n'
+              '                + ", shortsBackground=" + REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS_SHORTS\n'
+              '                + ", autoPause=" + Settings.AUTO_PAUSE_ON_LOCK.get());')
+          replace(p, '    private static void onVideoStateChanged(VideoState state) {',
+              '    private static void onVideoStateChanged(VideoState state) {\n'
+              '        Logger.printDebug(() -> "ShortsLock v9 state=" + state\n'
+              '                + ", shorts=" + ShortsPlayerState.isOpen());')
+          # Keep native Shorts streams but retain Morphe media-session compatibility fix.
+          shared = 'extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/spoof/SpoofVideoStreamsPatch.java'
+          replace(shared,
+              '    public static boolean useMediaSessionFeatureFlag(boolean original) {\n        if (bypassCurrentShort()) return original;',
+              '    public static boolean useMediaSessionFeatureFlag(boolean original) {')
+          replace('gradle.properties', 'version = 1.46.0-shorts-experimental.8',
+                  'version = 1.46.0-shorts-experimental.9')
+          print('v9 experimental: honor Shorts background setting in shared gate; restore media session compatibility; add ShortsLock debug logs')
+          PY
+      - name: Add Working Mode switch to Shorts menu
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('morphe-patches')
+          def replace(path,old,new):
+              p=root/path;s=p.read_text();assert s.count(old)==1,(path,old);p.write_text(s.replace(old,new))
+          base='extensions/youtube/src/main/java/app/morphe/extension/youtube/'
+          (root/base/'patches/WorkingModePatch.java').write_text('''package app.morphe.extension.youtube.patches;
+
+          import app.morphe.extension.youtube.settings.Settings;
+
+          /** Live control of Shorts background eligibility; does not force playback. */
+          public final class WorkingModePatch {
+              private WorkingModePatch() {}
+              public static boolean isPatchIncluded() { return false; }
+              public static boolean isEnabled() {
+                  return Settings.REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS.get()
+                          && !Settings.DISABLE_SHORTS_BACKGROUND_PLAYBACK.get();
+              }
+              public static void setEnabled(boolean enabled) {
+                  if (enabled) Settings.REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS.save(true);
+                  Settings.DISABLE_SHORTS_BACKGROUND_PLAYBACK.save(!enabled);
+              }
+          }
+          ''')
+          p=base+'patches/BackgroundPlaybackPatch.java'
+          replace(p,'''    private static final boolean REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS
+                      = Settings.REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS.get();
+
+              private static final boolean REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS_SHORTS
+                      = !Settings.DISABLE_SHORTS_BACKGROUND_PLAYBACK.get();''','''    // Read the setting at each hook so the menu switch works without restart.''')
+          f=root/p;s=f.read_text()
+          s=s.replace('REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS_SHORTS','WorkingModePatch.isEnabled()')
+          s=s.replace('REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS','Settings.REMOVE_BACKGROUND_PLAYBACK_RESTRICTIONS.get()')
+          # Enforce Shorts OFF before accepting an already-true native result.
+          old='''        if (original) return true;
+
+                  // Steps to verify'''
+          new='''        if (ShortsPlayerState.isOpen()) return WorkingModePatch.isEnabled();
+                  if (original) return true;
+
+                  // Steps to verify'''
+          assert s.count(old)==1;s=s.replace(old,new)
+          s=s.replace('''        if (ShortsPlayerState.isOpen()) {
+                      return WorkingModePatch.isEnabled();
+                  }
+
+          ''','')
+          f.write_text(s)
+          # Reuse the real flyout hook and native menu row, not a screen overlay.
+          p=base+'patches/utils/FlyoutUtils.java'
+          replace(p,'import android.widget.TextView;','''import android.widget.TextView;
+          import android.widget.Switch;
+          import android.view.Gravity;
+          import app.morphe.extension.youtube.patches.WorkingModePatch;''')
+          replace(p,'        if (!allButtonsVideoId.isEmpty()) {','''        if (WorkingModePatch.isPatchIncluded() && ShortsPlayerState.isOpen()
+                          && PlayerType.getCurrent().isNoneOrHidden()
+                          && flyoutCommentId.isEmpty() && flyoutPostId.isEmpty()
+                          && !allButtonsVideoId.isEmpty()) {
+                      nextButtonIndex = addFlyoutButton(flyoutPanel, playbackSpeedWhitelistButtonDrawable,
+                              "워킹 모드", null, nextButtonIndex);
+                  }
+
+                  if (!allButtonsVideoId.isEmpty()) {''')
+          replace(p,'''        customButton.setOnClickListener(clickListener);
+
+                  return customButton;''','''        if ("워킹 모드".equals(text) && WorkingModePatch.isPatchIncluded()) {
+                      // Keep YouTube's own typography, icon tint and row padding.
+                      LinearLayout row = new LinearLayout(context);
+                      row.setOrientation(LinearLayout.HORIZONTAL);
+                      row.setGravity(Gravity.CENTER_VERTICAL);
+                      row.setLayoutParams(new LinearLayout.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                      row.addView(customButton, new LinearLayout.LayoutParams(
+                              0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                      Switch toggle = new Switch(context);
+                      toggle.setShowText(false);
+                      toggle.setContentDescription("워킹 모드, 쇼츠 백그라운드 및 잠금 재생 허용");
+                      toggle.setChecked(WorkingModePatch.isEnabled());
+                      int edge = Math.round(16 * context.getResources().getDisplayMetrics().density);
+                      toggle.setMinHeight(Math.round(48 * context.getResources().getDisplayMetrics().density));
+                      LinearLayout.LayoutParams switchParams = new LinearLayout.LayoutParams(
+                              ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                      switchParams.setMarginEnd(edge);
+                      row.addView(toggle, switchParams);
+                      toggle.setOnCheckedChangeListener((button, checked) -> {
+                          WorkingModePatch.setEnabled(checked);
+                          toggle.announceForAccessibility(checked ? "워킹 모드 켜짐" : "워킹 모드 꺼짐");
+                      });
+                      customButton.setOnClickListener(v -> toggle.setChecked(!toggle.isChecked()));
+                      row.setOnClickListener(v -> toggle.setChecked(!toggle.isChecked()));
+                      return row;
+                  }
+                  customButton.setOnClickListener(clickListener);
+
+                  return customButton;''')
+          p='patches/src/main/kotlin/app/morphe/patches/youtube/misc/backgroundplayback/BackgroundPlaybackPatch.kt'
+          replace(p,'import app.morphe.patcher.Fingerprint\n','''import app.morphe.patcher.Fingerprint
+          import app.morphe.patches.youtube.layout.flyout.flyoutPatch
+          import app.morphe.util.setExtensionIsPatchIncluded
+          ''')
+          replace(p,'        sharedExtensionPatch,','        sharedExtensionPatch,\n        flyoutPatch,')
+          replace(p,'    execute {','''    execute {
+                  setExtensionIsPatchIncluded("Lapp/morphe/extension/youtube/patches/WorkingModePatch;")''')
+          replace('gradle.properties','version = 1.46.0-shorts-experimental.9','version = 1.46.0-shorts-experimental.10')
+          print('v10: native Shorts flyout Working Mode switch, live background settings')
+          PY
       - name: Build patch bundle
         working-directory: morphe-patches
         env:
@@ -553,7 +703,7 @@ jobs:
       - name: Upload patch bundle
         uses: actions/upload-artifact@v7
         with:
-          name: morphe-shorts-autoplay-v8
+          name: morphe-shorts-working-mode-v10
           path: morphe-patches/patches/build/libs/*.mpp
           if-no-files-found: error
           retention-days: 14
